@@ -4,14 +4,18 @@ on:
   repository_dispatch:
     types: [notarized_release]
 
+permissions:
+  contents: write
+
 jobs:
   update-cask:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+
     steps:
       - name: Checkout tap
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -21,31 +25,52 @@ jobs:
           APP_REPO: h3pdesign/Neon-Vision-Editor
           ASSET_NAME: Neon.Vision.Editor.app.zip
           CASK_PATH: Casks/neon-vision-editor.rb
+          DISPATCH_TAG: ${{ github.event.client_payload.tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          release_json="$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/${APP_REPO}/releases/latest")"
+
+          if [ -n "${DISPATCH_TAG:-}" ] && [ "${DISPATCH_TAG}" != "null" ]; then
+            echo "Using dispatched tag: ${DISPATCH_TAG}"
+            release_json="$(curl -fsSL \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${APP_REPO}/releases/tags/${DISPATCH_TAG}")"
+          else
+            echo "No dispatched tag found; falling back to latest release."
+            release_json="$(curl -fsSL \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${APP_REPO}/releases/latest")"
+          fi
+
           tag="$(echo "$release_json" | jq -r '.tag_name')"
           version="${tag#v}"
+
+          if [ -z "$tag" ] || [ "$tag" = "null" ] || [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "Invalid release tag from API: '$tag'" >&2
+            exit 1
+          fi
+
           asset_url="$(echo "$release_json" | jq -r --arg name "$ASSET_NAME" '.assets[] | select(.name==$name) | .browser_download_url')"
           if [ -z "$asset_url" ] || [ "$asset_url" = "null" ]; then
-            echo "Asset $ASSET_NAME not found on latest release."
+            echo "Asset $ASSET_NAME not found on release $tag." >&2
             exit 1
           fi
-          if [ -z "$tag" ] || [ "$tag" = "null" ] || [ -z "$version" ] || [ "$version" = "null" ]; then
-            echo "Invalid release tag from API: '$tag'"
-            exit 1
-          fi
-          curl -fsSL "$asset_url" -o "$ASSET_NAME"
-          sha256="$(shasum -a 256 "$ASSET_NAME" | awk '{print $1}')"
 
-          VERSION="$version" SHA256="$sha256" URL="$asset_url" ruby -e '
+          curl -fsSL -L "$asset_url" -o "$ASSET_NAME"
+          sha256="$(sha256sum "$ASSET_NAME" | awk '{print $1}')"
+
+          CASK_PATH="$CASK_PATH" VERSION="$version" SHA256="$sha256" URL="$asset_url" ruby -e '
             path = ENV.fetch("CASK_PATH")
             version = ENV.fetch("VERSION")
             sha256 = ENV.fetch("SHA256")
             url = ENV.fetch("URL")
+
             abort("invalid version") if version.empty? || version == "null"
             abort("invalid sha256") if sha256.empty? || sha256 == "null"
             abort("invalid url") if url.empty? || url == "null"
+            abort("cask file not found: #{path}") unless File.exist?(path)
 
             data = File.read(path)
             abort("version pattern not found") unless data.sub!(/version "[^"]*"/, "version \"#{version}\"")
@@ -59,17 +84,21 @@ jobs:
 
       - name: Commit and push
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Casks/neon-vision-editor.rb
+
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
+
           version="$(cat .cask-version 2>/dev/null || true)"
           if [ -z "$version" ]; then
             git commit -m "Update neon-vision-editor cask"
           else
             git commit -m "Update neon-vision-editor cask to v${version}"
           fi
+
           git push
