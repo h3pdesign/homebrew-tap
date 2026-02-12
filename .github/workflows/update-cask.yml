@@ -1,9 +1,8 @@
 name: Update cask from releases
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "0 * * * *"
+  repository_dispatch:
+    types: [notarized_release]
 
 jobs:
   update-cask:
